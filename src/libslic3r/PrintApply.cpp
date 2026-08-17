@@ -3,6 +3,7 @@
 #include "Print.hpp"
 #include "FilamentMixer.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <memory>
 
@@ -1393,13 +1394,48 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: process the filament_map related logic
     std::unordered_set<std::string> print_diff_set(print_diff.begin(), print_diff.end());
+
+    // filament_map / filament_volume_map / filament_nozzle_map are *outputs* of the slicer:
+    // BackgroundSlicingProcess writes them back onto the plate after a successful slice. The
+    // per-extruder retraction options are derived from the map through per-filament overrides,
+    // so they move with it. None of these are user edits, and the generated G-code already
+    // reflects them - invalidating completed steps because of them throws away a valid slice
+    // and greys out "Print Plate" (upstream issue #11776).
+    //
+    // Important: do NOT simply erase these keys from the diffs. The "if (! full_config_diff
+    // .empty())" block below does two jobs - it invalidates psGCodeExport AND commits the new
+    // values into m_config / m_full_print_config. Emptying the diff skips the commit as well,
+    // so the values never converge and reappear in print_diff on every subsequent apply().
+    // Instead let the commit happen and suppress only the invalidation.
+    bool slicer_owned_change_only = false;
+    if (print_diff_set.find("filament_map_mode") == print_diff_set.end()) {
+        const FilamentMapMode slicer_owned_mode =
+            new_full_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value;
+        // Only in auto modes does the slicer own these values. In manual modes the user owns
+        // them and a change must still invalidate.
+        if (is_auto_filament_map_mode(slicer_owned_mode)) {
+            std::unordered_set<std::string> slicer_owned{"filament_map", "filament_volume_map", "filament_nozzle_map"};
+            for (const auto &rk : print_config_def.extruder_retract_keys())
+                slicer_owned.insert(rk);
+            auto all_slicer_owned = [&slicer_owned](const t_config_option_keys &keys) {
+                return std::all_of(keys.begin(), keys.end(),
+                                   [&slicer_owned](const std::string &k) { return slicer_owned.count(k) > 0; });
+            };
+            // Only when these are the *sole* changes. Any genuine user edit alongside them
+            // brings other keys into the diff and invalidation proceeds as normal.
+            slicer_owned_change_only = !(full_config_diff.empty() && print_diff.empty()) &&
+                                       all_slicer_owned(full_config_diff) && all_slicer_owned(print_diff);
+        }
+    }
+
     if (!print_diff_set.empty() && print_diff_set.find("filament_map_mode") == print_diff_set.end())
     {
         FilamentMapMode map_mode = new_full_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value;
         if (is_auto_filament_map_mode(map_mode)) {
             if (print_diff_set.find("filament_map") != print_diff_set.end()) {
                 print_diff_set.erase("filament_map");
-                //full_config_diff.erase("filament_map");
+                // Intentionally NOT erased from full_config_diff: that would skip the config
+                // commit below. See slicer_owned_change_only above.
                 ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_map", true);
                 ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_map", true);
                 old_opt->set(new_opt);
@@ -1407,7 +1443,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             }
             if (print_diff_set.find("filament_volume_map") != print_diff_set.end()) {
                 print_diff_set.erase("filament_volume_map");
-                //full_config_diff.erase("filament_volume_map");
+                // see note above re: full_config_diff
                 ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_volume_map", true);
                 ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_volume_map", true);
                 old_opt->set(new_opt);
@@ -1415,7 +1451,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             }
             if (print_diff_set.find("filament_nozzle_map") != print_diff_set.end()) {
                 print_diff_set.erase("filament_nozzle_map");
-                //full_config_diff.erase("filament_nozzle_map");
+                // see note above re: full_config_diff
                 ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_nozzle_map", true);
                 ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_nozzle_map", true);
                 old_opt->set(new_opt);
@@ -1504,7 +1540,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	std::scoped_lock<std::mutex> lock(this->state_mutex());
 
     // The following call may stop the background processing.
-    if (! print_diff.empty())
+    if (! print_diff.empty() && ! slicer_owned_change_only)
         update_apply_status(this->invalidate_state_by_config_options(new_full_config, print_diff));
 
     // Apply variables to placeholder parser. The placeholder parser is used by G-code export,
@@ -1514,7 +1550,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     if (! full_config_diff.empty()) {
         //BBS: add more logs
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: found full_config_diff changed.")%__LINE__;
-        update_apply_status(this->invalidate_step(psGCodeExport));
+        // Slicer-owned changes still get committed below, but must not roll back the
+        // already-completed G-code export - that would discard a valid slice.
+        if (! slicer_owned_change_only)
+            update_apply_status(this->invalidate_step(psGCodeExport));
         m_placeholder_parser.clear_config();
         // Set the profile aliases for the PrintBase::output_filename()
 		m_placeholder_parser.set("print_preset",              new_full_config.option("print_settings_id")->clone());
